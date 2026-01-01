@@ -39,18 +39,30 @@ type CertInfo struct {
 	CheckedAt time.Time
 	// Error contains any error that occurred during checking.
 	Error string
+	// Revocation contains the certificate revocation status.
+	Revocation *RevocationInfo
 }
 
 // Checker performs TLS certificate checks against remote hosts.
 type Checker struct {
-	timeout time.Duration
+	timeout          time.Duration
+	checkRevocation  bool
 }
 
 // NewChecker creates a new Checker with the specified timeout.
 // The timeout applies to each individual TLS handshake operation.
 func NewChecker(timeout time.Duration) *Checker {
 	return &Checker{
-		timeout: timeout,
+		timeout:         timeout,
+		checkRevocation: false,
+	}
+}
+
+// NewCheckerWithRevocation creates a new Checker with revocation checking enabled.
+func NewCheckerWithRevocation(timeout time.Duration, checkRevocation bool) *Checker {
+	return &Checker{
+		timeout:         timeout,
+		checkRevocation: checkRevocation,
 	}
 }
 
@@ -112,14 +124,19 @@ func (c *Checker) CheckDomain(domain string) *CertInfo {
 
 	// Use the leaf certificate (first in chain) for expiry checking
 	cert := state.PeerCertificates[0]
-	info = c.extractCertInfo(cert, domain)
+	info = c.extractCertInfo(cert, domain, state.PeerCertificates)
+
+	// Perform revocation check if enabled
+	if c.checkRevocation && info.Error == "" {
+		info.Revocation = c.checkRevocationStatus(ctx, cert, state.PeerCertificates)
+	}
 
 	return info
 }
 
 // extractCertInfo pulls relevant fields from an x509 certificate.
 // We only extract fields needed for monitoring to keep the data structure lean.
-func (c *Checker) extractCertInfo(cert *x509.Certificate, domain string) *CertInfo {
+func (c *Checker) extractCertInfo(cert *x509.Certificate, domain string, chain []*x509.Certificate) *CertInfo {
 	now := time.Now()
 	timeUntilExpiry := cert.NotAfter.Sub(now)
 
@@ -148,7 +165,30 @@ func (c *Checker) extractCertInfo(cert *x509.Certificate, domain string) *CertIn
 		SerialNumber:       cert.SerialNumber.String(),
 		SignatureAlgorithm: cert.SignatureAlgorithm.String(),
 		CheckedAt:          now,
+		Revocation:         nil,
 	}
+}
+
+// checkRevocationStatus performs revocation checking using OCSP and CRL.
+func (c *Checker) checkRevocationStatus(ctx context.Context, cert *x509.Certificate, chain []*x509.Certificate) *RevocationInfo {
+	// Try to find issuer certificate in the chain
+	var issuer *x509.Certificate
+	if len(chain) > 1 {
+		issuer = chain[1]
+	} else {
+		// Try to fetch issuer from AIA
+		var err error
+		issuer, err = GetIssuerCertificate(cert, chain, c.timeout)
+		if err != nil {
+			return &RevocationInfo{
+				Status: RevocationStatusUnknown,
+				Method: "NONE",
+				Error:  fmt.Sprintf("issuer not available: %v", err),
+			}
+		}
+	}
+
+	return CheckRevocation(ctx, cert, issuer, c.timeout)
 }
 
 // CheckDomains checks multiple domains concurrently.

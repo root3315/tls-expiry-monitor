@@ -42,7 +42,7 @@ func run(args []string) int {
 	}
 
 	// Core configuration flags
-	domains := fs.String("domains", strings.Join(cfg.Domains, ","), 
+	domains := fs.String("domains", strings.Join(cfg.Domains, ","),
 		"Comma-separated list of domains to check (hostname:port format)")
 	warningDays := fs.Int("warning-days", cfg.WarningDays,
 		"Days until expiry to trigger WARNING alerts")
@@ -58,6 +58,8 @@ func run(args []string) int {
 		"Suppress INFO-level output, show only warnings and errors")
 	noColor := fs.Bool("no-color", false,
 		"Disable colored output")
+	checkRevocation := fs.Bool("check-revocation", cfg.CheckRevocation,
+		"Check certificate revocation status via OCSP/CRL")
 	version := fs.Bool("version", false,
 		"Print version information and exit")
 
@@ -83,6 +85,7 @@ func run(args []string) int {
 	cfg.Timeout = *timeout
 	cfg.JSONOutput = *jsonOutput
 	cfg.QuietMode = *quietMode
+	cfg.CheckRevocation = *checkRevocation
 
 	// Validate configuration before proceeding
 	if err := cfg.Validate(); err != nil {
@@ -96,8 +99,8 @@ func run(args []string) int {
 
 // executeChecks performs the actual certificate checking and alerting.
 func executeChecks(cfg *config.Config, noColor *bool) int {
-	// Create checker with configured timeout
-	tlsChecker := checker.NewChecker(cfg.Timeout)
+	// Create checker with configured timeout and revocation checking
+	tlsChecker := checker.NewCheckerWithRevocation(cfg.Timeout, cfg.CheckRevocation)
 
 	// Perform concurrent certificate checks
 	// Concurrent checking reduces total execution time for multiple domains
@@ -149,6 +152,9 @@ EXAMPLES:
     # Quiet mode for cron jobs (only shows problems)
     %s -domains example.com -quiet
 
+    # Check certificate revocation status via OCSP/CRL
+    %s -domains example.com -check-revocation
+
     # Using environment variables
     TLS_DOMAINS=example.com TLS_WARNING_DAYS=30 %s
 
@@ -159,15 +165,16 @@ EXIT CODES:
     3 - Configuration or runtime error
 
 ENVIRONMENT VARIABLES:
-    TLS_DOMAINS        Comma-separated list of domains to check
-    TLS_WARNING_DAYS   Days until expiry for WARNING alerts (default: 30)
-    TLS_CRITICAL_DAYS  Days until expiry for CRITICAL alerts (default: 7)
-    TLS_TIMEOUT        Network timeout in seconds (default: 10)
-    TLS_JSON           Enable JSON output (true/false)
-    TLS_QUIET          Suppress INFO output (true/false)
-    NO_COLOR           Disable colored terminal output
+    TLS_DOMAINS           Comma-separated list of domains to check
+    TLS_WARNING_DAYS      Days until expiry for WARNING alerts (default: 30)
+    TLS_CRITICAL_DAYS     Days until expiry for CRITICAL alerts (default: 7)
+    TLS_TIMEOUT           Network timeout in seconds (default: 10)
+    TLS_JSON              Enable JSON output (true/false)
+    TLS_QUIET             Suppress INFO output (true/false)
+    TLS_CHECK_REVOCATION  Enable revocation checking via OCSP/CRL (true/false)
+    NO_COLOR              Disable colored terminal output
 
-`, appName, appName, appName, appName, appName)
+`, appName, appName, appName, appName, appName, appName)
 }
 
 // formatDuration returns a human-readable duration string.

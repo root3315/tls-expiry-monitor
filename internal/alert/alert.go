@@ -17,27 +17,41 @@ import (
 
 // Alert represents a single certificate alert with all relevant information.
 type Alert struct {
-	Level           config.AlertLevel `json:"level"`
-	Domain          string            `json:"domain"`
-	CommonName      string            `json:"common_name,omitempty"`
-	SubjectAltNames []string          `json:"subject_alt_names,omitempty"`
-	Issuer          string            `json:"issuer,omitempty"`
-	ExpiryDate      time.Time         `json:"expiry_date"`
-	DaysUntilExpiry float64           `json:"days_until_expiry"`
-	SerialNumber    string            `json:"serial_number,omitempty"`
-	Message         string            `json:"message"`
-	CheckedAt       time.Time         `json:"checked_at"`
-	Error           string            `json:"error,omitempty"`
+	Level           config.AlertLevel      `json:"level"`
+	Domain          string                 `json:"domain"`
+	CommonName      string                 `json:"common_name,omitempty"`
+	SubjectAltNames []string               `json:"subject_alt_names,omitempty"`
+	Issuer          string                 `json:"issuer,omitempty"`
+	ExpiryDate      time.Time              `json:"expiry_date"`
+	DaysUntilExpiry float64                `json:"days_until_expiry"`
+	SerialNumber    string                 `json:"serial_number,omitempty"`
+	Message         string                 `json:"message"`
+	CheckedAt       time.Time              `json:"checked_at"`
+	Error           string                 `json:"error,omitempty"`
+	Revocation      *RevocationAlert       `json:"revocation,omitempty"`
+}
+
+// RevocationAlert holds revocation status information for alerts.
+type RevocationAlert struct {
+	Status       string    `json:"status"`
+	Method       string    `json:"method,omitempty"`
+	ReasonCode   int       `json:"reason_code,omitempty"`
+	ReasonText   string    `json:"reason_text,omitempty"`
+	RevokedAt    time.Time `json:"revoked_at,omitempty"`
+	NextUpdate   time.Time `json:"next_update,omitempty"`
+	ResponderURL string    `json:"responder_url,omitempty"`
+	Error        string    `json:"error,omitempty"`
 }
 
 // AlertSummary provides aggregate statistics about all checked certificates.
 type AlertSummary struct {
-	TotalChecked    int `json:"total_checked"`
-	Healthy         int `json:"healthy"`
-	WarningCount    int `json:"warning_count"`
-	CriticalCount   int `json:"critical_count"`
-	ExpiredCount    int `json:"expired_count"`
-	ErrorCount      int `json:"error_count"`
+	TotalChecked    int     `json:"total_checked"`
+	Healthy         int     `json:"healthy"`
+	WarningCount    int     `json:"warning_count"`
+	CriticalCount   int     `json:"critical_count"`
+	ExpiredCount    int     `json:"expired_count"`
+	ErrorCount      int     `json:"error_count"`
+	RevokedCount    int     `json:"revoked_count"`
 	AverageDaysLeft float64 `json:"average_days_left,omitempty"`
 }
 
@@ -91,12 +105,36 @@ func (f *AlertFormatter) FormatAlerts(infos []*checker.CertInfo, cfg *config.Con
 func (f *AlertFormatter) createAlert(info *checker.CertInfo, cfg *config.Config) *Alert {
 	level := cfg.GetAlertLevel(info.DaysUntilExpiry)
 
+	// Upgrade alert level if certificate is revoked
+	if info.Revocation != nil && info.Revocation.Status == checker.RevocationStatusRevoked {
+		level = config.AlertLevelCritical
+	}
+
 	var message string
 	if info.Error != "" {
 		message = info.Error
 		level = config.AlertLevelCritical
 	} else {
 		message = f.generateMessage(level, info.DaysUntilExpiry)
+		// Append revocation warning if revoked
+		if info.Revocation != nil && info.Revocation.Status == checker.RevocationStatusRevoked {
+			reason := checker.GetRevocationReasonString(info.Revocation.ReasonCode)
+			message = fmt.Sprintf("%s - certificate has been revoked (%s)", message, reason)
+		}
+	}
+
+	var revocationAlert *RevocationAlert
+	if info.Revocation != nil {
+		revocationAlert = &RevocationAlert{
+			Status:       info.Revocation.Status.String(),
+			Method:       info.Revocation.Method,
+			ReasonCode:   info.Revocation.ReasonCode,
+			ReasonText:   checker.GetRevocationReasonString(info.Revocation.ReasonCode),
+			RevokedAt:    info.Revocation.RevokedAt,
+			NextUpdate:   info.Revocation.NextUpdate,
+			ResponderURL: info.Revocation.ResponderURL,
+			Error:        info.Revocation.Error,
+		}
 	}
 
 	return &Alert{
@@ -111,6 +149,7 @@ func (f *AlertFormatter) createAlert(info *checker.CertInfo, cfg *config.Config)
 		Message:         message,
 		CheckedAt:       info.CheckedAt,
 		Error:           info.Error,
+		Revocation:      revocationAlert,
 	}
 }
 
@@ -141,7 +180,7 @@ func (f *AlertFormatter) outputText(alerts []*Alert, cfg *config.Config) {
 
 	for _, alert := range alerts {
 		// In quiet mode, skip INFO-level alerts without errors
-		if f.quietMode && alert.Level == config.AlertLevelInfo && alert.Error == "" {
+		if f.quietMode && alert.Level == config.AlertLevelInfo && alert.Error == "" && alert.Revocation == nil {
 			continue
 		}
 
@@ -162,6 +201,9 @@ func (f *AlertFormatter) printSummary(summary *AlertSummary) {
 	f.printf("Warning (≤%d days):         %d\n", 30, summary.WarningCount)
 	f.printf("Critical (≤%d days):        %d\n", 7, summary.CriticalCount)
 	f.printf("Expired:                    %d\n", summary.ExpiredCount)
+	if summary.RevokedCount > 0 {
+		f.printf("Revoked:                    %d\n", summary.RevokedCount)
+	}
 	if summary.ErrorCount > 0 {
 		f.printf("Errors:                     %d\n", summary.ErrorCount)
 	}
@@ -202,20 +244,80 @@ func (f *AlertFormatter) printAlert(alert *Alert) {
 			}
 		}
 	}
+
+	// Print revocation status if available
+	if alert.Revocation != nil {
+		f.printRevocationStatus(alert.Revocation)
+	}
+
 	f.println()
+}
+
+// printRevocationStatus outputs revocation status information.
+func (f *AlertFormatter) printRevocationStatus(rev *RevocationAlert) {
+	statusColor := "\033[32m" // Green for GOOD
+	statusReset := "\033[0m"
+
+	if !f.noColor && os.Getenv("NO_COLOR") == "" {
+		switch rev.Status {
+		case "REVOKED":
+			statusColor = "\033[31m" // Red
+		case "UNKNOWN":
+			statusColor = "\033[33m" // Yellow
+		}
+	}
+
+	statusStr := fmt.Sprintf("%s[%s]%s", statusColor, rev.Status, statusReset)
+	if rev.Method != "" {
+		f.printf("  Revocation Status: %s (via %s)\n", statusStr, rev.Method)
+	} else {
+		f.printf("  Revocation Status: %s\n", statusStr)
+	}
+
+	if rev.Status == "REVOKED" {
+		if !rev.RevokedAt.IsZero() {
+			f.printf("  Revoked At: %s\n", rev.RevokedAt.Format("2006-01-02 15:04:05"))
+		}
+		if rev.ReasonText != "" {
+			f.printf("  Reason: %s\n", rev.ReasonText)
+		}
+		if rev.ResponderURL != "" {
+			f.printf("  Responder: %s\n", rev.ResponderURL)
+		}
+	} else if rev.Error != "" && rev.Status != "GOOD" {
+		f.printf("  Note: %s\n", rev.Error)
+	}
 }
 
 // printRecommendations provides actionable advice based on alert results.
 func (f *AlertFormatter) printRecommendations(alerts []*Alert, cfg *config.Config) {
-	var criticalAlerts, expiredAlerts []*Alert
+	var criticalAlerts, expiredAlerts, revokedAlerts []*Alert
 
 	for _, alert := range alerts {
 		if alert.Level == config.AlertLevelCritical && alert.Error == "" {
-			criticalAlerts = append(criticalAlerts, alert)
+			if alert.Revocation != nil && alert.Revocation.Status == "REVOKED" {
+				revokedAlerts = append(revokedAlerts, alert)
+			} else {
+				criticalAlerts = append(criticalAlerts, alert)
+			}
 		}
 		if alert.Level == config.AlertLevelExpired {
 			expiredAlerts = append(expiredAlerts, alert)
 		}
+	}
+
+	if len(revokedAlerts) > 0 {
+		f.println("⚠️  ACTION REQUIRED: Revoked Certificates")
+		f.println("   The following certificates have been revoked by their CA:")
+		for _, alert := range revokedAlerts {
+			f.printf("   - %s", alert.Domain)
+			if alert.Revocation != nil && alert.Revocation.ReasonText != "" {
+				f.printf(" (%s)", alert.Revocation.ReasonText)
+			}
+			f.println()
+		}
+		f.println("   Replace these certificates immediately - they are no longer trusted.")
+		f.println()
 	}
 
 	if len(expiredAlerts) > 0 {
@@ -241,9 +343,9 @@ func (f *AlertFormatter) printRecommendations(alerts []*Alert, cfg *config.Confi
 // outputJSON writes alerts in JSON format for programmatic consumption.
 func (f *AlertFormatter) outputJSON(alerts []*Alert) {
 	output := struct {
-		Timestamp time.Time  `json:"timestamp"`
-		Alerts    []*Alert   `json:"alerts"`
-		Summary   *AlertSummary `json:"summary"`
+		Timestamp time.Time       `json:"timestamp"`
+		Alerts    []*Alert        `json:"alerts"`
+		Summary   *AlertSummary   `json:"summary"`
 	}{
 		Timestamp: time.Now(),
 		Alerts:    alerts,
@@ -273,6 +375,8 @@ func (f *AlertFormatter) calculateSummary(alerts []*Alert) *AlertSummary {
 		case config.AlertLevelCritical:
 			if alert.Error != "" {
 				summary.ErrorCount++
+			} else if alert.Revocation != nil && alert.Revocation.Status == "REVOKED" {
+				summary.RevokedCount++
 			} else {
 				summary.CriticalCount++
 			}

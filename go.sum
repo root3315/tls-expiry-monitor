@@ -1,2 +1,2 @@
-// This project uses only Go standard library packages.
-// No external dependencies are required.
+golang.org/x/crypto v0.17.0 h1:r8bRNjWMUe4pFJnNKpwjA6wtnhjjTnDsvcqCv3KtXNk=
+golang.org/x/crypto v0.17.0/go.mod h1:gCAAfMLgwOJRpTjQ2zCCt2OcSfYMTeZVSRtQlPC7Nq4=

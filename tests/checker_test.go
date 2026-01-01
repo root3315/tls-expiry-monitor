@@ -4,7 +4,13 @@ package tests
 
 import (
 	"bytes"
+	"context"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"math/big"
 	"strings"
 	"testing"
 	"time"
@@ -88,60 +94,66 @@ func TestConfigValidate(t *testing.T) {
 		{
 			name: "valid config",
 			cfg: &config.Config{
-				Domains:     []string{"example.com:443"},
-				WarningDays: 30,
-				CriticalDays: 7,
-				Timeout:     10 * time.Second,
+				Domains:       []string{"example.com:443"},
+				WarningDays:   30,
+				CriticalDays:  7,
+				Timeout:       10 * time.Second,
+				CheckRevocation: false,
 			},
 			expectError: false,
 		},
 		{
 			name: "no domains",
 			cfg: &config.Config{
-				Domains:     []string{},
-				WarningDays: 30,
-				CriticalDays: 7,
-				Timeout:     10 * time.Second,
+				Domains:       []string{},
+				WarningDays:   30,
+				CriticalDays:  7,
+				Timeout:       10 * time.Second,
+				CheckRevocation: false,
 			},
 			expectError: true,
 		},
 		{
 			name: "critical >= warning",
 			cfg: &config.Config{
-				Domains:     []string{"example.com:443"},
-				WarningDays: 7,
-				CriticalDays: 30,
-				Timeout:     10 * time.Second,
+				Domains:       []string{"example.com:443"},
+				WarningDays:   7,
+				CriticalDays:  30,
+				Timeout:       10 * time.Second,
+				CheckRevocation: false,
 			},
 			expectError: true,
 		},
 		{
 			name: "critical == warning",
 			cfg: &config.Config{
-				Domains:     []string{"example.com:443"},
-				WarningDays: 14,
-				CriticalDays: 14,
-				Timeout:     10 * time.Second,
+				Domains:       []string{"example.com:443"},
+				WarningDays:   14,
+				CriticalDays:  14,
+				Timeout:       10 * time.Second,
+				CheckRevocation: false,
 			},
 			expectError: true,
 		},
 		{
 			name: "zero timeout",
 			cfg: &config.Config{
-				Domains:     []string{"example.com:443"},
-				WarningDays: 30,
-				CriticalDays: 7,
-				Timeout:     0,
+				Domains:       []string{"example.com:443"},
+				WarningDays:   30,
+				CriticalDays:  7,
+				Timeout:       0,
+				CheckRevocation: false,
 			},
 			expectError: true,
 		},
 		{
 			name: "negative warning days",
 			cfg: &config.Config{
-				Domains:     []string{"example.com:443"},
-				WarningDays: -5,
-				CriticalDays: 7,
-				Timeout:     10 * time.Second,
+				Domains:       []string{"example.com:443"},
+				WarningDays:   -5,
+				CriticalDays:  7,
+				Timeout:       10 * time.Second,
+				CheckRevocation: false,
 			},
 			expectError: true,
 		},
@@ -296,7 +308,7 @@ func TestAlertFormatterTextOutput(t *testing.T) {
 	formatter.FormatAlerts(infos, cfg)
 
 	output := buf.String()
-	
+
 	// Verify key elements are present
 	if !strings.Contains(output, "TLS Certificate Expiry Summary") {
 		t.Error("output missing summary header")
@@ -386,7 +398,7 @@ func TestAlertFormatterQuietMode(t *testing.T) {
 	formatter.FormatAlerts(infos, cfg)
 
 	output := buf.String()
-	
+
 	// In quiet mode, healthy certificates should not appear in details
 	if strings.Contains(output, "healthy.com:443") {
 		t.Error("quiet mode should suppress INFO-level certificate details")
@@ -412,6 +424,9 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.QuietMode {
 		t.Error("expected QuietMode=false")
 	}
+	if cfg.CheckRevocation {
+		t.Error("expected CheckRevocation=false")
+	}
 	if len(cfg.Domains) != 0 {
 		t.Error("expected empty Domains slice")
 	}
@@ -424,6 +439,16 @@ func TestCheckerCreation(t *testing.T) {
 
 	if c == nil {
 		t.Fatal("NewChecker returned nil")
+	}
+}
+
+// TestCheckerWithRevocationCreation verifies checker with revocation checking.
+func TestCheckerWithRevocationCreation(t *testing.T) {
+	timeout := 15 * time.Second
+	c := checker.NewCheckerWithRevocation(timeout, true)
+
+	if c == nil {
+		t.Fatal("NewCheckerWithRevocation returned nil")
 	}
 }
 
@@ -524,5 +549,325 @@ func TestAlertSummaryCalculation(t *testing.T) {
 	}
 	if s.ExpiredCount != 1 {
 		t.Errorf("expected ExpiredCount=1, got %d", s.ExpiredCount)
+	}
+}
+
+// TestRevocationStatusString verifies revocation status string conversion.
+func TestRevocationStatusString(t *testing.T) {
+	tests := []struct {
+		status   checker.RevocationStatus
+		expected string
+	}{
+		{checker.RevocationStatusUnknown, "UNKNOWN"},
+		{checker.RevocationStatusGood, "GOOD"},
+		{checker.RevocationStatusRevoked, "REVOKED"},
+		{checker.RevocationStatusNotFound, "NOT_FOUND"},
+	}
+
+	for _, tt := range tests {
+		result := tt.status.String()
+		if result != tt.expected {
+			t.Errorf("status %v: expected %q, got %q", tt.status, tt.expected, result)
+		}
+	}
+}
+
+// TestGetRevocationReasonString verifies revocation reason code conversion.
+func TestGetRevocationReasonString(t *testing.T) {
+	tests := []struct {
+		code     int
+		expected string
+	}{
+		{0, "unspecified"},
+		{1, "key compromise"},
+		{2, "CA compromise"},
+		{3, "affiliation changed"},
+		{4, "superseded"},
+		{5, "cessation of operation"},
+		{6, "certificate hold"},
+		{8, "remove from CRL"},
+		{9, "privilege withdrawn"},
+		{10, "AA compromise"},
+		{99, "unknown (99)"},
+	}
+
+	for _, tt := range tests {
+		result := checker.GetRevocationReasonString(tt.code)
+		if result != tt.expected {
+			t.Errorf("code %d: expected %q, got %q", tt.code, tt.expected, result)
+		}
+	}
+}
+
+// TestRevocationInfoCreation verifies revocation info structure.
+func TestRevocationInfoCreation(t *testing.T) {
+	info := &checker.RevocationInfo{
+		Status: checker.RevocationStatusGood,
+		Method: "OCSP",
+	}
+
+	if info.Status != checker.RevocationStatusGood {
+		t.Errorf("expected status GOOD, got %v", info.Status)
+	}
+	if info.Method != "OCSP" {
+		t.Errorf("expected method OCSP, got %s", info.Method)
+	}
+}
+
+// TestAlertWithRevocationStatus verifies alert formatting with revocation status.
+func TestAlertWithRevocationStatus(t *testing.T) {
+	var buf bytes.Buffer
+	formatter := alert.NewAlertFormatter(&buf, true, false, true)
+
+	cfg := &config.Config{
+		WarningDays:  30,
+		CriticalDays: 7,
+	}
+
+	now := time.Now()
+	infos := []*checker.CertInfo{
+		{
+			Domain:          "revoked.com:443",
+			CommonName:      "revoked.com",
+			SubjectAltNames: []string{"revoked.com"},
+			Issuer:          "Test CA",
+			NotAfter:        now.Add(90 * 24 * time.Hour),
+			DaysUntilExpiry: 90,
+			CheckedAt:       now,
+			Revocation: &checker.RevocationInfo{
+				Status:     checker.RevocationStatusRevoked,
+				Method:     "OCSP",
+				ReasonCode: 1,
+				RevokedAt:  now.Add(-24 * time.Hour),
+			},
+		},
+	}
+
+	formatter.FormatAlerts(infos, cfg)
+
+	var result struct {
+		Alerts []alert.Alert `json:"alerts"`
+		Summary alert.AlertSummary `json:"summary"`
+	}
+
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("failed to parse JSON: %v", err)
+	}
+
+	if len(result.Alerts) != 1 {
+		t.Fatalf("expected 1 alert, got %d", len(result.Alerts))
+	}
+
+	alertItem := result.Alerts[0]
+	if alertItem.Revocation == nil {
+		t.Fatal("expected revocation info in alert")
+	}
+	if alertItem.Revocation.Status != "REVOKED" {
+		t.Errorf("expected revocation status REVOKED, got %s", alertItem.Revocation.Status)
+	}
+	if alertItem.Revocation.Method != "OCSP" {
+		t.Errorf("expected revocation method OCSP, got %s", alertItem.Revocation.Method)
+	}
+	if result.Summary.RevokedCount != 1 {
+		t.Errorf("expected RevokedCount=1, got %d", result.Summary.RevokedCount)
+	}
+}
+
+// TestAlertRevocationGoodStatus verifies alert with good revocation status.
+func TestAlertRevocationGoodStatus(t *testing.T) {
+	var buf bytes.Buffer
+	formatter := alert.NewAlertFormatter(&buf, true, false, true)
+
+	cfg := &config.Config{
+		WarningDays:  30,
+		CriticalDays: 7,
+	}
+
+	now := time.Now()
+	infos := []*checker.CertInfo{
+		{
+			Domain:          "valid.com:443",
+			CommonName:      "valid.com",
+			Issuer:          "Test CA",
+			NotAfter:        now.Add(90 * 24 * time.Hour),
+			DaysUntilExpiry: 90,
+			CheckedAt:       now,
+			Revocation: &checker.RevocationInfo{
+				Status: checker.RevocationStatusGood,
+				Method: "OCSP",
+			},
+		},
+	}
+
+	formatter.FormatAlerts(infos, cfg)
+
+	var result struct {
+		Alerts []alert.Alert `json:"alerts"`
+	}
+
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("failed to parse JSON: %v", err)
+	}
+
+	if len(result.Alerts) != 1 {
+		t.Fatalf("expected 1 alert, got %d", len(result.Alerts))
+	}
+
+	alertItem := result.Alerts[0]
+	if alertItem.Revocation == nil {
+		t.Fatal("expected revocation info in alert")
+	}
+	if alertItem.Revocation.Status != "GOOD" {
+		t.Errorf("expected revocation status GOOD, got %s", alertItem.Revocation.Status)
+	}
+}
+
+// TestAlertRevocationUnknownStatus verifies alert with unknown revocation status.
+func TestAlertRevocationUnknownStatus(t *testing.T) {
+	var buf bytes.Buffer
+	formatter := alert.NewAlertFormatter(&buf, true, false, true)
+
+	cfg := &config.Config{
+		WarningDays:  30,
+		CriticalDays: 7,
+	}
+
+	now := time.Now()
+	infos := []*checker.CertInfo{
+		{
+			Domain:          "unknown.com:443",
+			CommonName:      "unknown.com",
+			Issuer:          "Test CA",
+			NotAfter:        now.Add(90 * 24 * time.Hour),
+			DaysUntilExpiry: 90,
+			CheckedAt:       now,
+			Revocation: &checker.RevocationInfo{
+				Status: checker.RevocationStatusUnknown,
+				Method: "CRL",
+				Error:  "CRL fetch failed: connection refused",
+			},
+		},
+	}
+
+	formatter.FormatAlerts(infos, cfg)
+
+	var result struct {
+		Alerts []alert.Alert `json:"alerts"`
+	}
+
+	if err := json.Unmarshal(buf.Bytes(), &result); err != nil {
+		t.Fatalf("failed to parse JSON: %v", err)
+	}
+
+	if len(result.Alerts) != 1 {
+		t.Fatalf("expected 1 alert, got %d", len(result.Alerts))
+	}
+
+	alertItem := result.Alerts[0]
+	if alertItem.Revocation == nil {
+		t.Fatal("expected revocation info in alert")
+	}
+	if alertItem.Revocation.Status != "UNKNOWN" {
+		t.Errorf("expected revocation status UNKNOWN, got %s", alertItem.Revocation.Status)
+	}
+	if alertItem.Revocation.Error == "" {
+		t.Error("expected revocation error message")
+	}
+}
+
+// TestCheckRevocationWithNilCert verifies revocation check handles nil certificate.
+func TestCheckRevocationWithNilCert(t *testing.T) {
+	ctx := context.Background()
+	
+	// This should not panic and should return an appropriate error
+	defer func() {
+		if r := recover(); r != nil {
+			t.Errorf("CheckRevocation panicked with nil cert: %v", r)
+		}
+	}()
+	
+	info := checker.CheckRevocation(ctx, nil, nil, 5*time.Second)
+	if info == nil {
+		t.Error("expected non-nil revocation info")
+	}
+}
+
+// TestCreateSelfSignedCertForTesting creates a self-signed certificate for testing.
+func createSelfSignedCertForTesting(t *testing.T) (*x509.Certificate, *rsa.PrivateKey) {
+	t.Helper()
+
+	privKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatalf("failed to generate private key: %v", err)
+	}
+
+	serialNumber, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 128))
+	if err != nil {
+		t.Fatalf("failed to generate serial number: %v", err)
+	}
+
+	now := time.Now()
+	template := &x509.Certificate{
+		SerialNumber: serialNumber,
+		Subject: pkix.Name{
+			CommonName:   "test.example.com",
+			Organization: []string{"Test Organization"},
+		},
+		NotBefore:             now,
+		NotAfter:              now.Add(365 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		BasicConstraintsValid: true,
+		DNSNames:              []string{"test.example.com"},
+	}
+
+	return template, privKey
+}
+
+// TestRevocationInfoStructure verifies the RevocationInfo structure fields.
+func TestRevocationInfoStructure(t *testing.T) {
+	now := time.Now()
+	info := &checker.RevocationInfo{
+		Status:       checker.RevocationStatusRevoked,
+		Method:       "OCSP",
+		ReasonCode:   4,
+		RevokedAt:    now,
+		NextUpdate:   now.Add(24 * time.Hour),
+		ProducedAt:   now,
+		ResponderURL: "http://ocsp.example.com",
+		Error:        "",
+	}
+
+	if info.Status != checker.RevocationStatusRevoked {
+		t.Errorf("expected Status REVOKED, got %v", info.Status)
+	}
+	if info.Method != "OCSP" {
+		t.Errorf("expected Method OCSP, got %s", info.Method)
+	}
+	if info.ReasonCode != 4 {
+		t.Errorf("expected ReasonCode 4, got %d", info.ReasonCode)
+	}
+	if info.ResponderURL != "http://ocsp.example.com" {
+		t.Errorf("expected ResponderURL http://ocsp.example.com, got %s", info.ResponderURL)
+	}
+}
+
+// TestConfigWithRevocationEnabled verifies configuration with revocation checking.
+func TestConfigWithRevocationEnabled(t *testing.T) {
+	cfg := &config.Config{
+		Domains:         []string{"example.com:443"},
+		WarningDays:     30,
+		CriticalDays:    7,
+		Timeout:         10 * time.Second,
+		CheckRevocation: true,
+	}
+
+	err := cfg.Validate()
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+
+	if !cfg.CheckRevocation {
+		t.Error("expected CheckRevocation to be true")
 	}
 }

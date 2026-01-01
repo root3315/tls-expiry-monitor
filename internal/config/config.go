@@ -73,19 +73,22 @@ type Config struct {
 	QuietMode bool
 	// IncludeIPs checks IP addresses in addition to domain names.
 	IncludeIPs bool
+	// CheckRevocation enables certificate revocation checking via OCSP/CRL.
+	CheckRevocation bool
 }
 
 // DefaultConfig returns a configuration with sensible defaults.
 // These defaults work well for most production monitoring scenarios.
 func DefaultConfig() *Config {
 	return &Config{
-		Domains:     []string{},
-		WarningDays: 30,  // Warn when certificate expires within 30 days
-		CriticalDays: 7,  // Critical when certificate expires within 7 days
-		Timeout:     10 * time.Second,
-		JSONOutput:  false,
-		QuietMode:   false,
-		IncludeIPs:  false,
+		Domains:         []string{},
+		WarningDays:     30,  // Warn when certificate expires within 30 days
+		CriticalDays:    7,   // Critical when certificate expires within 7 days
+		Timeout:         10 * time.Second,
+		JSONOutput:      false,
+		QuietMode:       false,
+		IncludeIPs:      false,
+		CheckRevocation: false,
 	}
 }
 
@@ -142,6 +145,7 @@ func LoadFromEnv() *Config {
 
 	cfg.JSONOutput = os.Getenv("TLS_JSON") == "true" || os.Getenv("TLS_JSON") == "1"
 	cfg.QuietMode = os.Getenv("TLS_QUIET") == "true" || os.Getenv("TLS_QUIET") == "1"
+	cfg.CheckRevocation = os.Getenv("TLS_CHECK_REVOCATION") == "true" || os.Getenv("TLS_CHECK_REVOCATION") == "1"
 
 	return cfg
 }
